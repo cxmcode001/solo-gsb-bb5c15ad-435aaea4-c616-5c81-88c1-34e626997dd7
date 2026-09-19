@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .rfc1982 import MAX_SERIAL
 
@@ -144,3 +145,105 @@ class SerialReservationOut(BaseModel):
     replayed: bool = Field(
         default=False, description="true 表示本次为幂等重试，返回的是首次预留结果"
     )
+
+
+class ReleasePlanNode(BaseModel):
+    """多权威发布规划中的一个节点及其当前 serial。"""
+
+    name: str = Field(
+        min_length=1, max_length=253, examples=["ns1.example.com"], description="节点名（请求内唯一）"
+    )
+    serial: Serial = Field(description="节点当前持有的 SOA serial（沿用 32 位无符号校验）")
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        name = value.strip()
+        if not name:
+            raise ValueError("节点名不能为空")
+        return name
+
+
+class ReleasePlanCreate(BaseModel):
+    """多权威节点共同发布规划请求（仅规划，不写库）。"""
+
+    nodes: list[ReleasePlanNode] = Field(
+        min_length=1,
+        max_length=256,
+        description="参与本次发布的权威节点及其当前 serial（节点名须唯一）",
+    )
+    today: date | None = Field(
+        default=None,
+        description="规划所基于的日期（YYYY-MM-DD），缺省为服务器 UTC 当日",
+    )
+
+    @model_validator(mode="after")
+    def _check_unique_names(self) -> "ReleasePlanCreate":
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for node in self.nodes:
+            if node.name in seen and node.name not in duplicates:
+                duplicates.append(node.name)
+            seen.add(node.name)
+        if duplicates:
+            raise ValueError(f"节点名须唯一，重复节点名: {', '.join(duplicates)}")
+        return self
+
+
+class ReleasePlanNodeResult(BaseModel):
+    """候选 serial 相对单个节点的判定。"""
+
+    name: str
+    serial: int = Field(description="节点当前 serial")
+    relation: Literal["advance"] = Field(description="候选相对该节点的关系（共同候选必为有效前进）")
+    forward_distance: int = Field(
+        ge=1, le=2**31 - 1, description="从节点当前 serial 到候选值的模 2^32 前向距离"
+    )
+
+
+class CandidateWindow(BaseModel):
+    start: int = Field(description="当日候选区间起点 YYYYMMDD00")
+    end: int = Field(description="当日候选区间终点 YYYYMMDD99")
+
+
+class ReleasePlanOut(BaseModel):
+    zone: str
+    date: str = Field(description="规划所基于的日期（YYYYMMDD）")
+    candidate: int = Field(description="候选区间中首个对所有节点均为有效前进的 serial")
+    candidate_window: CandidateWindow
+    nodes: list[ReleasePlanNodeResult] = Field(
+        description="候选 serial 相对每个节点的关系与前向距离（与请求顺序一致）"
+    )
+    note: str
+
+
+class ReleasePlanBlocker(BaseModel):
+    """无共同候选时单个节点对当日候选区间的阻断摘要。"""
+
+    name: str
+    serial: int = Field(description="节点当前 serial")
+    advance: int = Field(ge=0, le=100, description="候选区间中对该节点为有效前进的值数")
+    equal: int = Field(ge=0, le=100, description="候选区间中与该节点相等的值数")
+    regression: int = Field(ge=0, le=100, description="候选区间中对该节点为倒退的值数")
+    incomparable: int = Field(ge=0, le=100, description="候选区间中与该节点不可比较的值数")
+
+
+class ReleasePlanConflictDetail(BaseModel):
+    """无共同候选时 409 响应的 detail 结构。"""
+
+    reason: Literal["no_common_candidate", "date_out_of_range"]
+    message: str
+    date: str = Field(description="规划所基于的日期（YYYYMMDD）")
+    candidate_window: CandidateWindow | None = Field(
+        default=None, description="当日候选区间；日期超出 32 位表达范围时为 null"
+    )
+    checked: int = Field(default=0, description="扫描过的候选值数量（00..99 共 100 个）")
+    blockers: list[ReleasePlanBlocker] = Field(
+        default_factory=list, description="各节点对候选区间的 equal/regression/incomparable 阻断摘要"
+    )
+
+
+class ReleasePlanConflictResponse(BaseModel):
+    """无共同候选时 409 响应体（HTTPException 的标准 detail 包装）。"""
+
+    detail: ReleasePlanConflictDetail

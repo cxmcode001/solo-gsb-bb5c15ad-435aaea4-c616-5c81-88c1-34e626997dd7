@@ -13,12 +13,16 @@ from .schemas import (
     AuditListItem,
     AuditOut,
     NextSerialOut,
+    ReleasePlanConflictResponse,
+    ReleasePlanCreate,
+    ReleasePlanOut,
     RepairPlanOut,
     SerialReservationCreate,
     SerialReservationOut,
     validate_zone,
 )
 from .repair import build_repair_plan
+from .release_plan import ReleasePlanError, build_release_plan
 from .service import analyze
 from .suggest import SuggestionError, suggest_next_serial
 
@@ -188,6 +192,53 @@ def create_app(db_path: str | None = None) -> FastAPI:
         return db.list_serial_reservations(
             app.state.db_path, zone_name, limit=limit, offset=offset
         )
+
+    @app.post(
+        "/api/zones/{zone}/release-plans",
+        response_model=ReleasePlanOut,
+        responses={
+            409: {
+                "model": ReleasePlanConflictResponse,
+                "description": (
+                    "当日 YYYYMMDD00–99 区间无共同候选（no_common_candidate，"
+                    "detail 给出各节点 equal/regression/incomparable 阻断摘要），"
+                    "或规划日期超出 32 位表达范围（date_out_of_range）"
+                ),
+            }
+        },
+    )
+    def create_release_plan(zone: str, payload: ReleasePlanCreate) -> dict:
+        """为多权威节点规划共同发布 serial（仅规划，不写库）。
+
+        在当日 ``YYYYMMDD00``～``YYYYMMDD99`` 候选区间内按从小到大扫描，
+        返回首个相对**每个**节点当前 serial 都属于 RFC 1982 有效前进
+        （advance）的候选值，并给出候选相对每个节点的关系与前向距离。
+
+        整个候选区间都不存在共同候选时返回 409，``detail.blockers`` 给出
+        各节点对候选区间的 ``equal`` / ``regression`` / ``incomparable``
+        阻断计数（另附 ``advance`` 计数，四项之和为扫描候选数）。
+        """
+        zone_name = _normalize_zone(zone)
+        effective_today = payload.today or datetime.now(timezone.utc).date()
+        nodes = [(node.name, node.serial) for node in payload.nodes]
+        try:
+            return build_release_plan(zone_name, nodes, effective_today)
+        except ReleasePlanError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": exc.code,
+                    "message": str(exc),
+                    "date": exc.date_str,
+                    "candidate_window": (
+                        {"start": exc.window[0], "end": exc.window[1]}
+                        if exc.window is not None
+                        else None
+                    ),
+                    "checked": exc.checked,
+                    "blockers": exc.blockers,
+                },
+            ) from exc
 
     return app
 

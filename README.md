@@ -7,7 +7,8 @@
 - 提供 **YYYYMMDDnn** 风格的下一序列号建议，保证相对当前值为有效前进；当日编号耗尽或存在半区间歧义时返回 **409**；
 - 审计记录持久化于 SQLite，可按 ID 查询；
 - 支持基于已有审计**即时生成序列修复预演**（不落库）：首个 serial 不变，其后各项与上一个修复后值按 RFC 1982 比较，非有效前进即替换为上一修复后值加 1（32 位无符号回绕）；
-- 提供 **SOA 序列号持久化预留**：在 SQLite 写事务内按区域原子分配下一个 YYYYMMDDnn serial，并发请求不会获得重复值；以 `request_id` 为幂等键，重试安全返回首次结果；预留记录持久化，可按区域查询。
+- 提供 **SOA 序列号持久化预留**：在 SQLite 写事务内按区域原子分配下一个 YYYYMMDDnn serial，并发请求不会获得重复值；以 `request_id` 为幂等键，重试安全返回首次结果；预留记录持久化，可按区域查询；
+- 提供 **多权威节点共同发布规划**（`POST /api/zones/{zone}/release-plans`，仅规划不写库）：提交各权威节点的名称与当前 serial，在当日 `YYYYMMDD00`～`99` 候选区间内从小到大找出首个相对**每个节点**都是 RFC 1982 有效前进的候选值；当日区间不存在共同候选时返回 **409**，并给出各节点的 `equal`/`regression`/`incomparable` 阻断摘要。
 
 ## 快速启动（单条命令）
 
@@ -15,7 +16,7 @@
 docker compose up --build
 ```
 
-启动后访问 **http://localhost:8000**（交互式文档见 http://localhost:8000/docs）。
+启动后在浏览器访问 **http://localhost:8000**（根路径返回服务信息；交互式 API 文档见 **http://localhost:8000/docs**，健康检查 http://localhost:8000/health）。
 
 依赖安装与 SQLite 建表均在启动时自动完成，无需额外初始化步骤；数据通过命名卷 `dns-audit-data` 持久化。
 
@@ -37,6 +38,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/api/next-serial?current=<serial>` | YYYYMMDDnn 下一序列号建议（歧义/耗尽返回 409） |
 | `POST` | `/api/zones/{zone}/serial-reservations` | 原子预留下一个 serial 并持久化（201；幂等重试返回 200；冲突返回 409） |
 | `GET` | `/api/zones/{zone}/serial-reservations` | 按区域查询预留记录（预留先后升序，支持 `limit`/`offset`） |
+| `POST` | `/api/zones/{zone}/release-plans` | 多权威节点共同发布规划，不写库（200；当日无共同候选返回 409） |
 | `GET` | `/health` | 健康检查 |
 
 ### 提交审计
@@ -180,6 +182,66 @@ curl -s 'http://localhost:8000/api/zones/example.com/serial-reservations?limit=5
 
 > 预留记录写入同一个 SQLite 数据库（容器内 `/data/audits.db`，由命名卷 `dns-audit-data` 持久化），服务重启后仍然存在，`current` 校验与幂等重试在重启后继续生效。路径中区域名非法时返回 **400**，请求体校验失败返回 **422**。
 
+### 多权威节点共同发布规划
+
+`POST /api/zones/{zone}/release-plans` 用于多权威（multi-primary）发布前的序列号协调：提交各权威节点的名称与当前 serial，服务端在当日 `YYYYMMDD00`～`YYYYMMDD99` 候选区间内**从小到大**扫描，返回首个相对**每个**节点当前 serial 都属于 RFC 1982 有效前进（advance）的候选值。规划结果**仅用于发布预演，不写入数据库**（不会产生审计或预留记录）。
+
+请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `nodes` | 节点列表（至少 1 个、至多 256 个）；每项含 `name`（节点名，去除首尾空白后须在请求内唯一）与 `serial`（当前 SOA serial，沿用 32 位无符号校验 `0..4294967295`） |
+| `today` | 可选，规划所基于的日期（`YYYY-MM-DD`）；缺省为服务器 UTC 当日 |
+
+```bash
+curl -s -X POST http://localhost:8000/api/zones/example.com/release-plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "today": "2026-09-19",
+        "nodes": [
+          {"name": "ns1.example.com", "serial": 2026091805},
+          {"name": "ns2.example.com", "serial": 2026010100}
+        ]
+      }'
+```
+
+```json
+{
+  "zone": "example.com",
+  "date": "20260919",
+  "candidate": 2026091900,
+  "candidate_window": {"start": 2026091900, "end": 2026091999},
+  "nodes": [
+    {"name": "ns1.example.com", "serial": 2026091805, "relation": "advance", "forward_distance": 95},
+    {"name": "ns2.example.com", "serial": 2026010100, "relation": "advance", "forward_distance": 81800}
+  ],
+  "note": "候选 serial 相对每个权威节点的当前 serial 均为 RFC 1982 意义下的有效前进；规划结果仅用于发布预演，不写入数据库"
+}
+```
+
+- `candidate` 为候选区间（`candidate_window`）中首个对所有节点都有效的值；若较小候选对某个节点是相等/倒退/不可比较，会被自动跳过（例如节点已持有 `YYYYMMDD03` 时会从 `04` 起继续寻找）；
+- `nodes[]` 与请求顺序一致，每项给出候选相对该节点的 `relation`（共同候选恒为 `advance`）与模 `2^32` 的 `forward_distance`（含 `4294967295 → 0` 这类回绕前进）；
+- 当整个 `00..99` 区间都不存在共同候选时返回 **409**，`detail.blockers` 按节点列出其对全部 100 个候选值的阻断计数（`equal` / `regression` / `incomparable`，另附 `advance`，四项之和为 `checked`=100）：
+
+```json
+{
+  "detail": {
+    "reason": "no_common_candidate",
+    "message": "当日 YYYYMMDDnn 候选区间（2026091900–2026091999）中不存在相对所有节点均为 RFC 1982 有效前进的共同候选 serial",
+    "date": "20260919",
+    "candidate_window": {"start": 2026091900, "end": 2026091999},
+    "checked": 100,
+    "blockers": [
+      {"name": "ns1.example.com", "serial": 4173575618, "advance": 70, "equal": 0, "regression": 29, "incomparable": 1},
+      {"name": "ns2.example.com", "serial": 2026091970, "advance": 29, "equal": 1, "regression": 70, "incomparable": 0}
+    ]
+  }
+}
+```
+
+- 上例中 `ns1` 只接受 `00..69`（在 `70` 处与候选相距恰好 `2^31` 不可比较），而 `ns2` 已持有 `9970`（仅 `71..99` 才是前进、`70` 相等），两节点可行区间互不相交，因此需等待下一日期或先协调各节点 serial；
+- 指定的 `today` 超出 32 位序列号可表达范围（如 `9999-12-31`）时返回 **409**，`detail.reason` 为 `date_out_of_range`；节点名重复/空白、`serial` 越界等请求体问题返回 **422**，路径中区域名非法返回 **400**。
+
 ## 判定规则（RFC 1982）
 
 serial 是模 `2^32` 环形空间上的值。设前向距离 `d = (current - previous) mod 2^32`：
@@ -214,6 +276,7 @@ app/
   rfc1982.py   # RFC 1982 序列号算术
   suggest.py   # YYYYMMDDnn 下一序列号建议
   repair.py    # 序列修复预演（不落库）
+  release_plan.py  # 多权威节点共同发布规划（不落库）
   service.py   # 逐项判定与汇总
   db.py        # SQLite 持久层（审计记录 + serial 预留的事务化分配与查询）
   schemas.py   # 请求/响应模型与校验
