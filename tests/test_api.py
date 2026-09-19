@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from app import db
 from app.main import create_app
+from app.release_plan import build_release_plan
 from app.rfc1982 import SERIAL_HALF, MAX_SERIAL, SERIAL_SPACE, classify
 from app.suggest import daily_base, suggest_next_serial, SuggestionError
 
@@ -581,3 +582,149 @@ def test_concurrent_same_request_id_races_to_one_reservation(tmp_path):
         assert {serial for _, serial in results} == {base + 1}
         rows = c.get("/api/zones/example.com/serial-reservations").json()
         assert len(rows) == 1
+
+
+# ---------- 多权威节点发布规划 ----------
+
+
+def test_release_plan_picks_first_common_candidate(client):
+    # ns1 在 base+5、ns2 在 base+2：base..base+5 对 ns1 非前进，首个共同候选为 base+6
+    resp = client.post(
+        "/api/zones/example.com/release-plans",
+        json={
+            "nodes": [
+                {"name": "ns1", "serial": BASE + 5},
+                {"name": "ns2", "serial": BASE + 2},
+            ],
+            "today": "2026-09-18",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["zone"] == "example.com"
+    assert body["date"] == "20260918"
+    assert body["serial"] == BASE + 6
+    assert [(n["name"], n["current"], n["relation"], n["distance"]) for n in body["nodes"]] == [
+        ("ns1", BASE + 5, "advance", 1),
+        ("ns2", BASE + 2, "advance", 4),
+    ]
+    # 候选值相对每个节点确为 RFC 1982 有效前进
+    for node in body["nodes"]:
+        assert classify(node["current"], body["serial"]) == "advance"
+
+
+def test_release_plan_behind_base_and_wraparound(client):
+    # 落后于当日基准的节点与回绕边界的节点，共同候选均为 YYYYMMDD00
+    resp = client.post(
+        "/api/zones/example.com/release-plans",
+        json={
+            "nodes": [
+                {"name": "ns1", "serial": 2026010100},
+                {"name": "ns2", "serial": MAX_SERIAL},
+            ],
+            "today": "2026-09-18",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["serial"] == BASE
+    distances = {n["name"]: n["distance"] for n in body["nodes"]}
+    assert distances["ns1"] == BASE - 2026010100
+    # MAX_SERIAL 前进 1 步回绕到 0，再到 BASE 共 BASE + 1 步
+    assert distances["ns2"] == BASE + 1
+
+
+def test_release_plan_default_today_uses_utc(client):
+    base = _utc_today_base()
+    resp = client.post(
+        "/api/zones/example.com/release-plans",
+        json={"nodes": [{"name": "ns1", "serial": base}]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["serial"] == base + 1
+    assert body["date"] == datetime.now(timezone.utc).strftime("%Y%m%d")
+
+
+def test_release_plan_409_with_blocking_summary(client):
+    # ns1 已领先当日区间（base+99）：全部候选被 equal/regression 阻断；
+    # ns2 与候选 base+3 相距恰好 2^31：贡献 incomparable 阻断
+    ns2_serial = (BASE + 3 - SERIAL_HALF) % SERIAL_SPACE
+    resp = client.post(
+        "/api/zones/example.com/release-plans",
+        json={
+            "nodes": [
+                {"name": "ns1", "serial": BASE + 99},
+                {"name": "ns2", "serial": ns2_serial},
+            ],
+            "today": "2026-09-18",
+        },
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "no_common_candidate"
+    assert detail["date"] == "20260918"
+    blockers = {b["name"]: b for b in detail["blockers"]}
+    assert blockers["ns1"] == {
+        "name": "ns1", "current": BASE + 99, "equal": 1, "regression": 99, "incomparable": 0,
+    }
+    assert blockers["ns2"] == {
+        "name": "ns2", "current": ns2_serial, "equal": 0, "regression": 96, "incomparable": 1,
+    }
+    # 每个节点的阻断计数 + 可行候选数 = 当日 100 个候选
+    for blocker in blockers.values():
+        assert blocker["equal"] + blocker["regression"] + blocker["incomparable"] <= 100
+
+
+def test_release_plan_409_date_out_of_range(client):
+    resp = client.post(
+        "/api/zones/example.com/release-plans",
+        json={"nodes": [{"name": "ns1", "serial": 1}], "today": "5000-01-01"},
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "date_out_of_range"
+    assert resp.json()["detail"]["blockers"] == []
+
+
+def test_release_plan_not_persisted(client):
+    resp = client.post(
+        "/api/zones/example.com/release-plans",
+        json={"nodes": [{"name": "ns1", "serial": BASE}], "today": "2026-09-18"},
+    )
+    assert resp.status_code == 200
+    # 规划不写库：审计与预留记录均不受影响
+    assert client.get("/api/audits").json() == []
+    assert client.get("/api/zones/example.com/serial-reservations").json() == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"nodes": []},                                            # 空节点列表
+        {"nodes": [{"name": "ns1", "serial": -1}]},               # serial 越界
+        {"nodes": [{"name": "ns1", "serial": MAX_SERIAL + 1}]},   # serial 越界
+        {"nodes": [{"name": "  ", "serial": BASE}]},              # 节点名空白
+        {"nodes": [{"serial": BASE}]},                            # 缺节点名
+        {"nodes": [{"name": "ns1", "serial": BASE},
+                   {"name": "ns1", "serial": BASE + 1}]},         # 节点名重复
+        {"nodes": [{"name": "ns1", "serial": BASE}], "today": "not-a-date"},  # 日期非法
+    ],
+)
+def test_release_plan_invalid_payload_422(client, payload):
+    resp = client.post("/api/zones/example.com/release-plans", json=payload)
+    assert resp.status_code == 422
+
+
+def test_release_plan_invalid_zone_400(client):
+    resp = client.post(
+        "/api/zones/bad_zone!/release-plans",
+        json={"nodes": [{"name": "ns1", "serial": BASE}]},
+    )
+    assert resp.status_code == 400
+
+
+def test_build_release_plan_unit():
+    # 直接验证纯函数：单节点落在区间内时取 current+1
+    plan = build_release_plan("example.com", [("ns1", BASE + 41)], TODAY)
+    assert plan["serial"] == BASE + 42
+    assert plan["nodes"][0]["distance"] == 1

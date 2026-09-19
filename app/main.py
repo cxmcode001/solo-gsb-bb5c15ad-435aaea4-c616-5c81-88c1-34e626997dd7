@@ -7,12 +7,16 @@ from datetime import date, datetime, timezone
 from fastapi import FastAPI, HTTPException, Query, Response
 
 from . import db
+from .release_plan import ReleasePlanError, build_release_plan
 from .rfc1982 import MAX_SERIAL
 from .schemas import (
     AuditCreate,
     AuditListItem,
     AuditOut,
     NextSerialOut,
+    ReleasePlanBlocker,
+    ReleasePlanCreate,
+    ReleasePlanOut,
     RepairPlanOut,
     SerialReservationCreate,
     SerialReservationOut,
@@ -44,7 +48,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
         description=(
             "提交区域名与按观测时间排列的 SOA serial，按 RFC 1982 模运算"
             "逐项判定前进/倒退/相等/不可比较，标出可能使从服务器拒绝更新的"
-            "节点，并提供 YYYYMMDDnn 风格的下一序列号建议。"
+            "节点，并提供 YYYYMMDDnn 风格的下一序列号建议、原子预留与"
+            "多权威节点联合发布规划。"
         ),
         version="1.0.0",
         lifespan=lifespan,
@@ -188,6 +193,56 @@ def create_app(db_path: str | None = None) -> FastAPI:
         return db.list_serial_reservations(
             app.state.db_path, zone_name, limit=limit, offset=offset
         )
+
+    @app.post(
+        "/api/zones/{zone}/release-plans",
+        response_model=ReleasePlanOut,
+        responses={
+            400: {"description": "路径中区域名非法"},
+            409: {
+                "description": "当日区间内无共同候选（附逐节点阻断摘要），或日期超出 32 位表达范围",
+                "content": {
+                    "application/json": {
+                        "example": {
+                            "detail": {
+                                "reason": "no_common_candidate",
+                                "message": "当日区间 2026091900-2026091999 内不存在相对所有节点均为有效前进的候选 serial",
+                                "date": "20260919",
+                                "blockers": [
+                                    {"name": "ns1", "current": 2026091999, "equal": 1, "regression": 99, "incomparable": 0}
+                                ],
+                            }
+                        }
+                    }
+                },
+            },
+        },
+    )
+    def create_release_plan(zone: str, payload: ReleasePlanCreate) -> dict:
+        """多权威节点联合发布规划（不写库）。
+
+        在当日 YYYYMMDD00~99 候选区间内按从小到大选择首个相对每个节点
+        当前 serial 均为 RFC 1982 有效前进的候选值；无共同候选时返回 409，
+        并附各节点对候选区间的 equal/regression/incomparable 阻断摘要。
+        """
+        zone_name = _normalize_zone(zone)
+        effective_today = payload.today or datetime.now(timezone.utc).date()
+        nodes = [(node.name, node.serial) for node in payload.nodes]
+        try:
+            return build_release_plan(zone_name, nodes, effective_today)
+        except ReleasePlanError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": exc.code,
+                    "message": str(exc),
+                    "date": effective_today.strftime("%Y%m%d"),
+                    "blockers": [
+                        ReleasePlanBlocker(**blocker).model_dump()
+                        for blocker in exc.blockers
+                    ],
+                },
+            ) from exc
 
     return app
 
